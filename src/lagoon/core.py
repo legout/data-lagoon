@@ -1,16 +1,17 @@
+
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 @dataclass
 class TableMetadata:
     full_name: str
     data_source_format: str
     storage_location: str
-    schema_json: dict | None = None
+    schema_json: Optional[dict] = None
 
 class BaseTable:
-    def __init__(self, meta: TableMetadata, adapter: Any):
+    def __init__(self, meta: TableMetadata, adapter: Any) -> None:
         self.meta = meta
         self._adapter = adapter
 

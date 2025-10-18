@@ -1,10 +1,9 @@
+
 from __future__ import annotations
 from typing import Protocol, Any, Optional
 
 class TableAdapter(Protocol):
-    storage_location: str
-    format: str  # DELTA | ICEBERG | PARQUET
-
+    format: str
     def to_arrow(self) -> Any: ...
     def to_polars(self) -> Any: ...
     def write(self, df: Any, mode: str = "append") -> None: ...
