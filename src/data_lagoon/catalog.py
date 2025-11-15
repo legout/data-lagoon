@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import sqlite3
 from typing import Any, Dict, Optional, Sequence, Tuple
 from urllib.parse import ParseResult, urlparse, urlunparse
@@ -170,6 +171,8 @@ _SCHEMA_STATEMENTS: Tuple[str, ...] = (
         file_path TEXT NOT NULL,
         file_size_bytes INTEGER,
         row_count INTEGER,
+        schema_version_id INTEGER REFERENCES schema_versions(id),
+        metadata_json TEXT,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         is_tombstoned INTEGER NOT NULL DEFAULT 0,
         UNIQUE(dataset_id, file_path, version)
@@ -242,7 +245,20 @@ class SqlCatalog:
 
         for statement in _SCHEMA_STATEMENTS:
             self._connection.execute(statement)
+        self._ensure_files_table_columns()
         self._connection.commit()
+
+    def _ensure_files_table_columns(self) -> None:
+        cursor = self._connection.execute("PRAGMA table_info(files)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "schema_version_id" not in columns:
+            self._connection.execute(
+                "ALTER TABLE files ADD COLUMN schema_version_id INTEGER REFERENCES schema_versions(id)"
+            )
+        if "metadata_json" not in columns:
+            self._connection.execute(
+                "ALTER TABLE files ADD COLUMN metadata_json TEXT"
+            )
 
     # ------------------------------------------------------------ dataset ops
     def register_dataset(self, name: str, base_uri: str) -> DatasetIdentity:
@@ -372,7 +388,7 @@ class SqlCatalog:
             self._connection.close()
 
     # ---------------------------------------------------------- write helpers
-    def record_basic_write(
+    def record_write_with_metadata(
         self,
         dataset: DatasetIdentity,
         *,
@@ -387,32 +403,115 @@ class SqlCatalog:
         if not files:
             raise CatalogError("At least one file record is required for a write")
 
-        self._connection.execute(
-            "INSERT INTO transactions (dataset_id, version, operation) VALUES (?, ?, ?)",
-            (dataset.id, version, "append"),
-        )
-        self._connection.executemany(
-            """
-            INSERT INTO files (dataset_id, version, file_path, file_size_bytes, row_count)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    dataset.id,
-                    version,
-                    entry["file_path"],
-                    entry.get("file_size_bytes"),
-                    entry.get("row_count"),
+        with self._connection:  # begins transaction
+            self._connection.execute(
+                "INSERT INTO transactions (dataset_id, version, operation) VALUES (?, ?, ?)",
+                (dataset.id, version, "append"),
+            )
+
+            for entry in files:
+                schema_bytes = entry.get("schema_bytes")
+                schema_version_id = (
+                    self._get_or_create_schema_version(dataset.id, schema_bytes)
+                    if schema_bytes is not None
+                    else None
                 )
-                for entry in files
-            ],
-        )
-        self._connection.execute(
-            "UPDATE datasets SET current_version = ? WHERE id = ?",
-            (version, dataset.id),
-        )
-        self._connection.commit()
+
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO files (
+                        dataset_id,
+                        version,
+                        file_path,
+                        file_size_bytes,
+                        row_count,
+                        schema_version_id,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        dataset.id,
+                        version,
+                        entry["file_path"],
+                        entry.get("file_size_bytes"),
+                        entry.get("row_count"),
+                        schema_version_id,
+                        json.dumps(entry.get("metadata_dict")) if entry.get("metadata_dict") else None,
+                    ),
+                )
+                file_id = cursor.lastrowid
+                self._persist_row_groups(file_id, entry.get("row_groups") or [])
+                self._persist_partitions(file_id, entry.get("partitions") or {})
+
+            self._connection.execute(
+                "UPDATE datasets SET current_version = ? WHERE id = ?",
+                (version, dataset.id),
+            )
+
         return self.get_dataset_by_id(dataset.id)
+
+    def _get_or_create_schema_version(
+        self, dataset_id: int, schema_bytes: Optional[bytes]
+    ) -> Optional[int]:
+        if schema_bytes is None:
+            return None
+        cursor = self._connection.execute(
+            "SELECT id FROM schema_versions WHERE dataset_id = ? AND arrow_schema = ?",
+            (dataset_id, schema_bytes),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+        cursor = self._connection.execute(
+            "SELECT COALESCE(MAX(version), -1) FROM schema_versions WHERE dataset_id = ?",
+            (dataset_id,),
+        )
+        next_version = (cursor.fetchone()[0] or -1) + 1
+        cursor = self._connection.execute(
+            """
+            INSERT INTO schema_versions (dataset_id, version, arrow_schema)
+            VALUES (?, ?, ?)
+            """,
+            (dataset_id, next_version, schema_bytes),
+        )
+        return cursor.lastrowid
+
+    def _persist_row_groups(
+        self, file_id: int, row_groups: Sequence[dict[str, Any]]
+    ) -> None:
+        for rg in row_groups:
+            self._connection.execute(
+                """
+                INSERT INTO row_groups (
+                    file_id,
+                    row_group_index,
+                    row_count,
+                    stats_min_json,
+                    stats_max_json,
+                    null_counts_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    rg.get("row_group_index"),
+                    rg.get("row_count"),
+                    json.dumps(rg.get("stats_min")),
+                    json.dumps(rg.get("stats_max")),
+                    json.dumps(rg.get("null_counts")),
+                ),
+            )
+
+    def _persist_partitions(
+        self, file_id: int, partitions: Dict[str, str]
+    ) -> None:
+        for key, value in partitions.items():
+            self._connection.execute(
+                "INSERT INTO partitions (file_id, key, value) VALUES (?, ?, ?)",
+                (file_id, key, value),
+            )
 
     def list_files_for_version(
         self, dataset_id: int, version: int

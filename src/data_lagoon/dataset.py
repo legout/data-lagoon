@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
@@ -27,6 +27,7 @@ class WriteResult:
     row_count: int
     files: Sequence[str]
     version: int
+    file_metadata: Sequence[dict[str, Any]] = ()
 
 
 try:  # optional dependency
@@ -63,6 +64,48 @@ def _prepare_write_destination(fs_handle: FileSystemHandle, version: int) -> Tup
     return version_dir, basename_template
 
 
+def _extract_partitions(relative_path: str, sep: str) -> Dict[str, str]:
+    segments = [segment for segment in relative_path.split(sep) if segment]
+    partitions: Dict[str, str] = {}
+    for segment in segments:
+        if "=" in segment:
+            key, value = segment.split("=", 1)
+            partitions[key] = value
+    return partitions
+
+
+def _extract_row_groups(metadata: Optional[pa.parquet.FileMetaData]) -> List[dict[str, Any]]:
+    if metadata is None:
+        return []
+    meta_dict = metadata.to_dict()
+    row_groups: List[dict[str, Any]] = []
+    for idx, rg in enumerate(meta_dict.get("row_groups", [])):
+        stats_min: Dict[str, Any] = {}
+        stats_max: Dict[str, Any] = {}
+        null_counts: Dict[str, Any] = {}
+        for column in rg.get("columns", []):
+            stats = column.get("statistics") or {}
+            name = column.get("path_in_schema") or column.get("name")
+            if name is None:
+                continue
+            if "min" in stats:
+                stats_min[name] = stats["min"]
+            if "max" in stats:
+                stats_max[name] = stats["max"]
+            if "null_count" in stats:
+                null_counts[name] = stats["null_count"]
+        row_groups.append(
+            {
+                "row_group_index": idx,
+                "row_count": rg.get("num_rows"),
+                "stats_min": stats_min,
+                "stats_max": stats_max,
+                "null_counts": null_counts,
+            }
+        )
+    return row_groups
+
+
 def write_dataset(
     ref_or_name: DatasetRef | str,
     data: Any,
@@ -80,6 +123,7 @@ def write_dataset(
             raise DatasetError("Dataset has no base_uri configured")
 
         table = _normalize_to_table(data)
+        schema_bytes = table.schema.serialize().to_pybytes()
         version = dataset.current_version + 1
         fs_handle = resolve_filesystem(dataset.base_uri)
         base_dir, filename_template = _prepare_write_destination(fs_handle, version)
@@ -101,11 +145,16 @@ def write_dataset(
                 size = fs_handle.filesystem.size(relative_path)
             except Exception:
                 size = None
+            partitions = _extract_partitions(relative_path, sep)
             written_files.append(
                 {
                     "file_path": absolute_path,
                     "row_count": row_count,
                     "file_size_bytes": size,
+                    "partitions": partitions,
+                    "row_groups": _extract_row_groups(written.metadata),
+                    "schema_bytes": schema_bytes,
+                    "metadata_dict": written.metadata.to_dict() if written.metadata else None,
                 }
             )
 
@@ -124,7 +173,7 @@ def write_dataset(
         if not written_files:
             raise DatasetError("write_dataset produced no output files")
 
-        updated_dataset = catalog.record_basic_write(
+        updated_dataset = catalog.record_write_with_metadata(
             dataset,
             version=version,
             files=written_files,
@@ -144,6 +193,7 @@ def write_dataset(
         row_count=total_rows,
         files=[entry["file_path"] for entry in written_files],
         version=version,
+        file_metadata=[entry.get("metadata_dict") or {} for entry in written_files],
     )
 
 

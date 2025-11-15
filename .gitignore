@@ -5,3 +5,5 @@
 .opencode/
 .github/prompts
 var/
+test.parquet
+test2.parquet

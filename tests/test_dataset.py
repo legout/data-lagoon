@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import fsspec
+import sqlite3
 import pyarrow as pa
 import pyarrow.dataset as ds
 
@@ -71,6 +72,27 @@ class DatasetReadWriteTests(unittest.TestCase):
         write_dataset("example", table, catalog_uri=self.catalog_uri, base_uri=self.base_uri)
         dataset_obj = read_dataset("example", catalog_uri=self.catalog_uri, as_dataset=True)
         self.assertIsInstance(dataset_obj, ds.Dataset)
+
+    def test_metadata_persisted(self) -> None:
+        table = pa.table({"value": [10, 20]})
+        write_dataset("example", table, catalog_uri=self.catalog_uri, base_uri=self.base_uri)
+
+        conn = sqlite3.connect(self.catalog_path)
+        try:
+            row = conn.execute(
+                "SELECT schema_version_id, metadata_json FROM files"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            schema_version_id, metadata_json = row
+            self.assertIsNotNone(schema_version_id)
+            self.assertIsNotNone(metadata_json)
+
+            row_group_count = conn.execute(
+                "SELECT COUNT(*) FROM row_groups"
+            ).fetchone()[0]
+            self.assertGreater(row_group_count, 0)
+        finally:
+            conn.close()
 
     def _uri_exists(self, uri: str) -> bool:
         fs, path = fsspec.url_to_fs(uri)
