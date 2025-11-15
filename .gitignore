@@ -1,3 +1,7 @@
 .venv
 .env
 .worktrees
+.claude/
+.opencode/
+.github/prompts
+var/
