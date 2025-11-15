@@ -159,6 +159,21 @@ class DatasetReadWriteTests(unittest.TestCase):
         fs, path = fsspec.url_to_fs(uri)
         return fs.exists(path)
 
+    def test_memory_filesystem_round_trip(self) -> None:
+        base_uri = "memory://bucket/dataset"
+        catalog = os.path.join(self.temp_dir.name, "mem_catalog.db")
+        table = pa.table({"value": [10, 20, 30]})
+        write_dataset(
+            DatasetRef(name="example", base_uri=base_uri),
+            table,
+            catalog_uri=f"sqlite:///{catalog}",
+        )
+        result = read_dataset(
+            DatasetRef(name="example"),
+            catalog_uri=f"sqlite:///{catalog}",
+        )
+        self.assertEqual(result.to_pydict(), {"value": [10, 20, 30]})
+
 
 if __name__ == "__main__":
     unittest.main()
