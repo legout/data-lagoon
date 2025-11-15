@@ -410,12 +410,7 @@ class SqlCatalog:
             )
 
             for entry in files:
-                schema_bytes = entry.get("schema_bytes")
-                schema_version_id = (
-                    self._get_or_create_schema_version(dataset.id, schema_bytes)
-                    if schema_bytes is not None
-                    else None
-                )
+                schema_version_id = entry.get("schema_version_id")
 
                 cursor = self._connection.execute(
                     """
@@ -434,9 +429,9 @@ class SqlCatalog:
                         dataset.id,
                         version,
                         entry["file_path"],
-                        entry.get("file_size_bytes"),
-                        entry.get("row_count"),
-                        schema_version_id,
+                    entry.get("file_size_bytes"),
+                    entry.get("row_count"),
+                    schema_version_id,
                         json.dumps(entry.get("metadata_dict")) if entry.get("metadata_dict") else None,
                     ),
                 )
@@ -450,6 +445,28 @@ class SqlCatalog:
             )
 
         return self.get_dataset_by_id(dataset.id)
+
+    def get_latest_schema_bytes(self, dataset_id: int) -> Optional[bytes]:
+        cursor = self._connection.execute(
+            """
+            SELECT arrow_schema
+            FROM schema_versions
+            WHERE dataset_id = ?
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (dataset_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if hasattr(row, "keys"):
+            return row["arrow_schema"]
+        return row[0]
+
+    def ensure_schema_version(self, dataset_id: int, schema_bytes: bytes) -> int:
+        with self._connection:
+            return self._get_or_create_schema_version(dataset_id, schema_bytes)
 
     def _get_or_create_schema_version(
         self, dataset_id: int, schema_bytes: Optional[bytes]
@@ -469,14 +486,24 @@ class SqlCatalog:
             (dataset_id,),
         )
         next_version = (cursor.fetchone()[0] or -1) + 1
-        cursor = self._connection.execute(
-            """
-            INSERT INTO schema_versions (dataset_id, version, arrow_schema)
-            VALUES (?, ?, ?)
-            """,
-            (dataset_id, next_version, schema_bytes),
-        )
-        return cursor.lastrowid
+        try:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO schema_versions (dataset_id, version, arrow_schema)
+                VALUES (?, ?, ?)
+                """,
+                (dataset_id, next_version, schema_bytes),
+            )
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            cursor = self._connection.execute(
+                "SELECT id FROM schema_versions WHERE dataset_id = ? AND version = ?",
+                (dataset_id, next_version),
+            )
+            row = cursor.fetchone()
+            if row:
+                return row[0] if not hasattr(row, "keys") else row["id"]
+            raise
 
     def _persist_row_groups(
         self, file_id: int, row_groups: Sequence[dict[str, Any]]

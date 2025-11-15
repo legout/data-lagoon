@@ -13,6 +13,7 @@ from .catalog import (
     looks_like_uri,
 )
 from .dataset import DatasetError, WriteResult, read_dataset, write_dataset
+from .schema_manager import SchemaMismatchError
 
 __all__ = [
     "CatalogError",
@@ -24,6 +25,7 @@ __all__ = [
     "connect_catalog",
     "looks_like_uri",
     "DatasetError",
+    "SchemaMismatchError",
     "WriteResult",
     "write_dataset",
     "read_dataset",

@@ -13,7 +13,7 @@ import pyarrow.dataset as ds
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from data_lagoon import DatasetRef  # noqa: E402
+from data_lagoon import DatasetRef, SchemaMismatchError  # noqa: E402
 from data_lagoon.dataset import DatasetError, read_dataset, write_dataset  # noqa: E402
 
 
@@ -173,6 +173,66 @@ class DatasetReadWriteTests(unittest.TestCase):
             catalog_uri=f"sqlite:///{catalog}",
         )
         self.assertEqual(result.to_pydict(), {"value": [10, 20, 30]})
+
+    def test_schema_add_column_merge(self) -> None:
+        table1 = pa.table({"value": [1, 2]})
+        write_dataset(
+            "example",
+            table1,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        table2 = pa.table({"value": [3], "extra": [10]})
+        write_dataset(
+            "example",
+            table2,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        result = read_dataset("example", catalog_uri=self.catalog_uri)
+        extra_column = result.column("extra").to_pylist()
+        self.assertEqual(extra_column, [10])
+
+    def test_schema_merge_disabled_raises(self) -> None:
+        table1 = pa.table({"value": [1, 2]})
+        write_dataset(
+            "example",
+            table1,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        table2 = pa.table({"value": [3, 4], "extra": [5, 6]})
+        with self.assertRaises(SchemaMismatchError):
+            write_dataset(
+                "example",
+                table2,
+                catalog_uri=self.catalog_uri,
+                base_uri=self.base_uri,
+                schema_merge=False,
+            )
+
+    def test_schema_type_promotion(self) -> None:
+        table1 = pa.table({"value": pa.array([1, 2], type=pa.int32())})
+        write_dataset(
+            "example",
+            table1,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        table2 = pa.table({"value": pa.array([3], type=pa.int64())})
+        write_dataset(
+            "example",
+            table2,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        result = read_dataset("example", catalog_uri=self.catalog_uri)
+        self.assertEqual(result.column("value").type, pa.int64())
 
 
 if __name__ == "__main__":

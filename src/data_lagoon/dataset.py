@@ -10,6 +10,13 @@ import pyarrow.fs as pa_fs
 from pyarrow.dataset import WrittenFile
 
 from .catalog import DatasetRef, connect_catalog
+from .schema_manager import (
+    SchemaMismatchError,
+    align_table_to_schema,
+    deserialize_schema,
+    merge_schemas,
+    serialize_schema,
+)
 from .storage import FileSystemHandle, resolve_filesystem
 
 
@@ -123,6 +130,8 @@ def write_dataset(
     catalog_uri: str = "sqlite:///:memory:",
     base_uri: Optional[str] = None,
     partition_by: Optional[Sequence[str]] = None,
+    schema_merge: bool = True,
+    promote_to_string: bool = False,
 ) -> WriteResult:
     catalog = connect_catalog(catalog_uri)
     try:
@@ -134,7 +143,21 @@ def write_dataset(
             raise DatasetError("Dataset has no base_uri configured")
 
         table = _normalize_to_table(data)
-        schema_bytes = table.schema.serialize().to_pybytes()
+        current_schema_bytes = catalog.get_latest_schema_bytes(dataset.id)
+        current_schema = (
+            deserialize_schema(current_schema_bytes)
+            if current_schema_bytes
+            else None
+        )
+        merge_result = merge_schemas(
+            current_schema,
+            table.schema,
+            schema_merge=schema_merge,
+            promote_to_string=promote_to_string,
+        )
+        table = align_table_to_schema(table, merge_result)
+        schema_bytes = serialize_schema(merge_result.schema)
+        schema_version_id = catalog.ensure_schema_version(dataset.id, schema_bytes)
         version = dataset.current_version + 1
         fs_handle = resolve_filesystem(dataset.base_uri)
         base_dir, filename_template = _prepare_write_destination(fs_handle, version)
@@ -164,7 +187,7 @@ def write_dataset(
                     "file_size_bytes": size,
                     "partitions": partitions,
                     "row_groups": _extract_row_groups(written.metadata),
-                    "schema_bytes": schema_bytes,
+                    "schema_version_id": schema_version_id,
                     "metadata_dict": written.metadata.to_dict() if written.metadata else None,
                 }
             )
