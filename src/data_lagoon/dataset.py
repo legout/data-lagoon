@@ -112,6 +112,7 @@ def write_dataset(
     *,
     catalog_uri: str = "sqlite:///:memory:",
     base_uri: Optional[str] = None,
+    partition_by: Optional[Sequence[str]] = None,
 ) -> WriteResult:
     catalog = connect_catalog(catalog_uri)
     try:
@@ -160,11 +161,18 @@ def write_dataset(
 
         arrow_fs = _to_arrow_fs(fs_handle)
 
+        partitioning = (
+            ds.partitioning(pa.schema([(name, table.schema.field(name).type) for name in partition_by]), flavor="hive")
+            if partition_by
+            else None
+        )
+
         ds.write_dataset(
             data=table,
             base_dir=base_dir,
             format="parquet",
             basename_template=filename_template,
+            partitioning=partitioning,
             existing_data_behavior="overwrite_or_ignore",
             file_visitor=_visitor,
             filesystem=arrow_fs,

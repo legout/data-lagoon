@@ -73,6 +73,27 @@ class DatasetReadWriteTests(unittest.TestCase):
         dataset_obj = read_dataset("example", catalog_uri=self.catalog_uri, as_dataset=True)
         self.assertIsInstance(dataset_obj, ds.Dataset)
 
+    def test_partitioned_write_persists_partitions(self) -> None:
+        table = pa.table(
+            {"date": ["2024-01-01", "2024-01-02"], "value": [1, 2]}
+        )
+        write_dataset(
+            "example",
+            table,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+            partition_by=["date"],
+        )
+
+        conn = sqlite3.connect(self.catalog_path)
+        try:
+            partitions = conn.execute(
+                "SELECT key, value FROM partitions ORDER BY key, value"
+            ).fetchall()
+            self.assertEqual(partitions, [("date", "2024-01-01"), ("date", "2024-01-02")])
+        finally:
+            conn.close()
+
     def test_metadata_persisted(self) -> None:
         table = pa.table({"value": [10, 20]})
         write_dataset("example", table, catalog_uri=self.catalog_uri, base_uri=self.base_uri)
