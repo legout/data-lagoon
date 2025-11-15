@@ -94,6 +94,46 @@ class DatasetReadWriteTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_partition_predicate_filters_rows(self) -> None:
+        table = pa.table(
+            {"date": ["2024-01-01", "2024-01-02"], "value": [1, 2]}
+        )
+        write_dataset(
+            "example",
+            table,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+            partition_by=["date"],
+        )
+
+        filtered = read_dataset(
+            "example",
+            catalog_uri=self.catalog_uri,
+            predicates=[("date", "==", "2024-01-01")],
+        )
+        self.assertEqual(filtered.to_pydict(), {"date": ["2024-01-01"], "value": [1]})
+
+    def test_row_group_predicate_filters_values(self) -> None:
+        schema = pa.schema([("value", pa.int64())])
+        batches = [
+            pa.RecordBatch.from_arrays([pa.array([0, 1, 2])], schema.names),
+            pa.RecordBatch.from_arrays([pa.array([3, 4])], schema.names),
+        ]
+        reader = pa.RecordBatchReader.from_batches(schema, batches)
+        write_dataset(
+            "example",
+            reader,
+            catalog_uri=self.catalog_uri,
+            base_uri=self.base_uri,
+        )
+
+        filtered = read_dataset(
+            "example",
+            catalog_uri=self.catalog_uri,
+            predicates=[("value", ">=", 3)],
+        )
+        self.assertEqual(filtered.to_pydict(), {"value": [3, 4]})
+
     def test_metadata_persisted(self) -> None:
         table = pa.table({"value": [10, 20]})
         write_dataset("example", table, catalog_uri=self.catalog_uri, base_uri=self.base_uri)

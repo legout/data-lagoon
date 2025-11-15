@@ -527,6 +527,83 @@ class SqlCatalog:
         rows = cursor.fetchall()
         return [row[0] if not hasattr(row, "keys") else row["file_path"] for row in rows]
 
+    def list_file_records_for_version(
+        self, dataset_id: int, version: int
+    ) -> Sequence[dict[str, Any]]:
+        cursor = self._connection.execute(
+            """
+            SELECT id, file_path FROM files
+            WHERE dataset_id = ? AND version = ?
+            ORDER BY id
+            """,
+            (dataset_id, version),
+        )
+        rows = cursor.fetchall()
+        records = []
+        for row in rows:
+            if hasattr(row, "keys"):
+                records.append({"id": row["id"], "file_path": row["file_path"]})
+            else:
+                records.append({"id": row[0], "file_path": row[1]})
+        return records
+
+    def fetch_partitions_for_files(
+        self, file_ids: Sequence[int]
+    ) -> Dict[int, Dict[str, str]]:
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        cursor = self._connection.execute(
+            f"""
+            SELECT file_id, key, value
+            FROM partitions
+            WHERE file_id IN ({placeholders})
+            """,
+            tuple(file_ids),
+        )
+        mapping: Dict[int, Dict[str, str]] = {}
+        for file_id, key, value in cursor.fetchall():
+            mapping.setdefault(file_id, {})[key] = value
+        return mapping
+
+    def fetch_row_groups_for_files(
+        self, file_ids: Sequence[int]
+    ) -> Dict[int, List[dict[str, Any]]]:
+        if not file_ids:
+            return {}
+        placeholders = ",".join("?" for _ in file_ids)
+        cursor = self._connection.execute(
+            f"""
+            SELECT file_id, row_group_index, row_count, stats_min_json, stats_max_json, null_counts_json
+            FROM row_groups
+            WHERE file_id IN ({placeholders})
+            """,
+            tuple(file_ids),
+        )
+        results: Dict[int, List[dict[str, Any]]] = {}
+        for row in cursor.fetchall():
+            if hasattr(row, "keys"):
+                file_id = row["file_id"]
+                rg = {
+                    "row_group_index": row["row_group_index"],
+                    "row_count": row["row_count"],
+                    "stats_min_json": row["stats_min_json"],
+                    "stats_max_json": row["stats_max_json"],
+                    "null_counts_json": row["null_counts_json"],
+                }
+            else:
+                file_id = row[0]
+                rg = {
+                    "row_group_index": row[1],
+                    "row_count": row[2],
+                    "stats_min_json": row[3],
+                    "stats_max_json": row[4],
+                    "null_counts_json": row[5],
+                }
+            results.setdefault(file_id, []).append(rg)
+        return results
+
+
     # ------------------------------------------------------------ row helpers
     def _row_to_dataset(self, cursor: Any, row: Any) -> Optional[DatasetIdentity]:
         if row is None:
