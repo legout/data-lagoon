@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pa_fs
-import pyarrow.parquet as pq
 from pyarrow.dataset import WrittenFile
 
 from .catalog import DatasetRef, connect_catalog
@@ -260,30 +259,14 @@ def read_dataset(
         predicates=parsed_predicates,
     )
 
-    if not pruned_files:
-        raise DatasetError("No data matches the provided predicates")
-
-    any_path = pruned_files[0]["file_path"]
-    first_handle = resolve_filesystem(any_path)
-    arrow_fs = _to_arrow_fs(first_handle)
-
-    paths: List[str] = []
-    row_group_map: Dict[str, Dict[str, Any]] = {}
-    for record in pruned_files:
-        uri = record["file_path"]
-        handle = resolve_filesystem(uri)
-        if handle.protocol != first_handle.protocol:
-            raise DatasetError("Mixed storage backends within a single version are not supported yet")
-        paths.append(handle.root_path)
-        row_group_map[handle.root_path] = {
-            "row_groups": record.get("row_groups"),
-            "partitions": record.get("partitions") or {},
-        }
-
-    dataset_obj = ds.dataset(paths, format="parquet", filesystem=arrow_fs)
+    dataset_obj = _build_dataset_from_fragments(
+        pruned_files,
+        predicates=parsed_predicates,
+    )
     if as_dataset:
         return dataset_obj
-    return _materialize_table_with_row_groups(dataset_obj, arrow_fs, row_group_map)
+    filter_expr = _build_arrow_filter(parsed_predicates)
+    return dataset_obj.to_table(filter=filter_expr)
 
 
 def _prune_files_and_row_groups(
@@ -294,10 +277,8 @@ def _prune_files_and_row_groups(
     file_records: Sequence[dict[str, Any]],
     predicates: Sequence[Predicate],
 ) -> List[dict[str, Any]]:
-    if not predicates:
-        return [
-            {"file_path": record["file_path"], "row_groups": None} for record in file_records
-        ]
+    partition_map: Dict[int, Dict[str, str]] = {}
+    row_group_map: Dict[int, List[dict[str, Any]]] = {}
 
     catalog = connect_catalog(catalog_uri)
     try:
@@ -306,6 +287,18 @@ def _prune_files_and_row_groups(
         row_group_map = catalog.fetch_row_groups_for_files(file_ids)
     finally:
         catalog.close()
+
+    if not predicates:
+        return [
+            {
+                "file_id": record["id"],
+                "file_path": record["file_path"],
+                "row_groups": None,
+                "partitions": partition_map.get(record["id"], {}),
+                "stats": _compute_file_stats(row_group_map.get(record["id"], [])),
+            }
+            for record in file_records
+        ]
 
     eq_partition_filters = {
         pred.column: pred.value for pred in predicates if pred.op == "=="
@@ -328,22 +321,16 @@ def _prune_files_and_row_groups(
 
         result.append(
             {
+                "file_id": file_id,
                 "file_path": file_path,
                 "row_groups": selected_row_groups,
                 "partitions": partitions,
+                "stats": _compute_file_stats(row_group_map.get(file_id, [])),
             }
         )
 
     if not result:
-        # Fall back to scanning all files if pruning removed everything
-        return [
-            {
-                "file_path": record["file_path"],
-                "row_groups": None,
-                "partitions": partition_map.get(record["id"], {}),
-            }
-            for record in file_records
-        ]
+        raise DatasetError("No data matches the provided predicates")
     return result
 
 
@@ -411,38 +398,116 @@ def _row_group_matches(
     return True
 
 
-def _materialize_table_with_row_groups(
-    dataset_obj: ds.Dataset,
-    filesystem: pa_fs.FileSystem,
-    row_group_map: Dict[str, Dict[str, Any]],
-) -> pa.Table:
-    if not any(entry.get("row_groups") for entry in row_group_map.values()):
-        return dataset_obj.to_table()
+def _build_dataset_from_fragments(
+    pruned_files: Sequence[dict[str, Any]],
+    predicates: Sequence[Predicate],
+) -> ds.Dataset:
+    if not pruned_files:
+        raise DatasetError("No data matches the provided predicates")
 
-    tables: List[pa.Table] = []
-    for path, entry in row_group_map.items():
-        row_groups = entry.get("row_groups")
-        partitions = entry.get("partitions") or {}
-        if row_groups:
-            with filesystem.open_input_file(path) as handle:
-                parquet_file = pq.ParquetFile(handle)
-                table = parquet_file.read_row_groups(row_groups)
-        else:
-            subset = ds.dataset([path], format="parquet", filesystem=filesystem)
-            table = subset.to_table()
+    first_handle = resolve_filesystem(pruned_files[0]["file_path"])
+    arrow_fs = _to_arrow_fs(first_handle)
+    format = ds.ParquetFileFormat()
 
-        if partitions:
-            table = _append_partition_columns(table, partitions)
-        tables.append(table)
+    fragments: List[ds.ParquetFileFragment] = []
+    schema: Optional[pa.Schema] = None
+    partition_field_names: set[str] = set()
 
-    if not tables:
-        return dataset_obj.to_table()
-    return pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    for record in pruned_files:
+        handle = resolve_filesystem(record["file_path"])
+        if handle.protocol != first_handle.protocol:
+            raise DatasetError(
+                "Mixed storage backends within a single version are not supported yet"
+            )
+
+        partition_field_names.update((record.get("partitions") or {}).keys())
+
+        fragment_expr = _build_fragment_expression(
+            record.get("partitions") or {},
+            record.get("stats") or {},
+        )
+        fragment = format.make_fragment(
+            handle.root_path,
+            filesystem=arrow_fs,
+            partition_expression=fragment_expr,
+            row_groups=record.get("row_groups"),
+        )
+        fragments.append(fragment)
+        schema = schema or fragment.physical_schema
+
+    if not fragments or schema is None:
+        raise DatasetError("Unable to build fragments for dataset")
+
+    for field_name in partition_field_names:
+        if schema.get_field_index(field_name) == -1:
+            schema = schema.append(pa.field(field_name, pa.string()))
+
+    dataset = ds.FileSystemDataset(fragments, schema, format, arrow_fs)
+    return dataset
 
 
-def _append_partition_columns(table: pa.Table, partitions: Dict[str, str]) -> pa.Table:
-    result = table
+def _build_fragment_expression(
+    partitions: Dict[str, str],
+    stats: Dict[str, Dict[str, Any]],
+) -> Optional[ds.Expression]:
+    expression: Optional[ds.Expression] = None
+
     for key, value in partitions.items():
-        array = pa.array([value] * result.num_rows)
-        result = result.append_column(key, array)
-    return result
+        part_expr = ds.field(key) == value
+        expression = part_expr if expression is None else expression & part_expr
+
+    for column, bounds in stats.items():
+        min_value = bounds.get("min")
+        max_value = bounds.get("max")
+        if min_value is None or max_value is None:
+            continue
+        lower = ds.field(column) >= min_value
+        upper = ds.field(column) <= max_value
+        stat_expr = lower & upper
+        expression = stat_expr if expression is None else expression & stat_expr
+
+    return expression
+
+
+def _build_arrow_filter(predicates: Sequence[Predicate]) -> Optional[ds.Expression]:
+    expression: Optional[ds.Expression] = None
+    for predicate in predicates:
+        field_expr = ds.field(predicate.column)
+        if predicate.op == "==":
+            comparison = field_expr == predicate.value
+        elif predicate.op == ">":
+            comparison = field_expr > predicate.value
+        elif predicate.op == ">=":
+            comparison = field_expr >= predicate.value
+        elif predicate.op == "<":
+            comparison = field_expr < predicate.value
+        elif predicate.op == "<=":
+            comparison = field_expr <= predicate.value
+        else:
+            raise DatasetError(f"Unsupported predicate operator '{predicate.op}'")
+
+        expression = comparison if expression is None else expression & comparison
+
+    return expression
+
+
+def _compute_file_stats(
+    row_group_records: Sequence[dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    stats: Dict[str, Dict[str, Any]] = {}
+    for record in row_group_records:
+        stats_min = (
+            json.loads(record["stats_min_json"]) if record.get("stats_min_json") else {}
+        )
+        stats_max = (
+            json.loads(record["stats_max_json"]) if record.get("stats_max_json") else {}
+        )
+        for key, value in stats_min.items():
+            entry = stats.setdefault(key, {"min": value, "max": value})
+            existing_min = entry.get("min")
+            entry["min"] = value if existing_min is None else min(existing_min, value)
+        for key, value in stats_max.items():
+            entry = stats.setdefault(key, {"min": value, "max": value})
+            existing_max = entry.get("max")
+            entry["max"] = value if existing_max is None else max(existing_max, value)
+    return stats
