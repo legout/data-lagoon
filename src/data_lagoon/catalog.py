@@ -6,7 +6,12 @@ from datetime import datetime
 import json
 import sqlite3
 from typing import Any, Dict, Optional, Sequence, Tuple
-from urllib.parse import ParseResult, urlparse, urlunparse
+from urllib.parse import ParseResult, parse_qs, urlparse, urlunparse
+
+try:
+    import psycopg
+except Exception:  # pragma: no cover - optional dependency
+    psycopg = None  # type: ignore
 
 try:  # DuckDB is optional; import lazily so it is not a hard dependency.
     import duckdb  # type: ignore
